@@ -19,6 +19,9 @@ import (
 	"github.com/errisnotnil/go-pgxq"
 )
 
+const shutdownTimeout = 10 * time.Second
+
+// SendEmail is a sample job payload.
 type SendEmail struct {
 	To      string `json:"to"`
 	Subject string `json:"subject"`
@@ -32,10 +35,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
 
-	if err := pgxq.Migrate(ctx, pool, pgxq.DefaultTable); err != nil {
-		log.Fatal(err)
+	if migrateErr := pgxq.Migrate(ctx, pool, pgxq.DefaultTable); migrateErr != nil {
+		pool.Close()
+		log.Fatal(migrateErr)
 	}
 
 	// Enqueue a job.
@@ -45,6 +48,7 @@ func main() {
 		Body:    "Your first job queue message.",
 	})
 	if err != nil {
+		pool.Close()
 		log.Fatal(err)
 	}
 	fmt.Printf("enqueued job %d (%s)\n", job.ID, job.Kind)
@@ -52,33 +56,34 @@ func main() {
 	// Process jobs.
 	client, err := pgxq.NewClient(pgxq.ClientConfig{Pool: pool})
 	if err != nil {
+		pool.Close()
 		log.Fatal(err)
 	}
-	client.Handle("send_email", func(_ context.Context, _ pgx.Tx, job *pgxq.Job) error {
-		args, err := pgxq.UnmarshalArgs[SendEmail](job)
-		if err != nil {
-			return pgxq.Discard(err)
+	client.Handle("send_email", func(_ context.Context, _ pgx.Tx, j *pgxq.Job) error {
+		args, unmarshalErr := pgxq.UnmarshalArgs[SendEmail](j)
+		if unmarshalErr != nil {
+			return pgxq.Discard(unmarshalErr)
 		}
 		fmt.Printf("sending email to %s: %s\n", args.To, args.Subject)
 		return nil
 	})
 
-	startErrCh := make(chan error, 1)
-	go func() { startErrCh <- client.Start() }()
+	go func() {
+		if startErr := client.Start(); startErr != nil {
+			log.Fatalf("client stopped unexpectedly: %v", startErr)
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
-
-	select {
-	case err := <-startErrCh:
-		log.Fatalf("client stopped unexpectedly: %v", err)
-	case <-sigCh:
-	}
+	<-sigCh
 
 	fmt.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := client.Stop(shutdownCtx); err != nil {
-		log.Fatal(err)
+	shutdownCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+	stopErr := client.Stop(shutdownCtx)
+	cancel()
+	pool.Close()
+	if stopErr != nil {
+		log.Fatal(stopErr)
 	}
 }

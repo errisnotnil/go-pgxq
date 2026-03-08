@@ -8,6 +8,7 @@ package pgxq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -26,6 +27,10 @@ type DBTX interface {
 }
 
 // HandlerFunc processes a single job within a transaction.
+//
+// Handlers must be idempotent. If tx.Commit fails due to a network error,
+// the commit may have already succeeded. The job will be rescued and retried,
+// so the handler may execute more than once for the same job.
 //
 // On success (nil return), the transaction is committed — any database work
 // done through tx is atomic with the job completion.
@@ -85,7 +90,7 @@ func scanJob(row pgx.Row) (*Job, error) {
 		&j.Error,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("pgxq: scan job: %w", err)
 	}
 	return &j, nil
 }
@@ -93,7 +98,7 @@ func scanJob(row pgx.Row) (*Job, error) {
 // validateTable checks that the table name is a valid identifier ([schema.]table).
 func validateTable(table string) error {
 	if table == "" {
-		return fmt.Errorf("pgxq: table name must not be empty")
+		return errors.New("pgxq: table name must not be empty")
 	}
 	dots := 0
 	for _, r := range table {
@@ -104,12 +109,15 @@ func validateTable(table string) error {
 			}
 			continue
 		}
+		if r >= 'A' && r <= 'Z' {
+			return fmt.Errorf("pgxq: uppercase character %q in table name %q (use lowercase)", r, table)
+		}
 		if !isIdentChar(r) {
 			return fmt.Errorf("pgxq: invalid character %q in table name %q", r, table)
 		}
 	}
-	for _, component := range strings.Split(table, ".") {
-		if len(component) > 0 && component[0] >= '0' && component[0] <= '9' {
+	for component := range strings.SplitSeq(table, ".") {
+		if component != "" && component[0] >= '0' && component[0] <= '9' {
 			return fmt.Errorf("pgxq: invalid table name %q (identifier cannot start with a digit)", table)
 		}
 	}
@@ -129,5 +137,5 @@ func UnmarshalArgs[T any](job *Job) (T, error) {
 }
 
 func isIdentChar(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_'
 }

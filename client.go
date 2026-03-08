@@ -2,9 +2,11 @@ package pgxq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,7 +74,7 @@ func (c *ClientConfig) setDefaults() {
 
 // clientQueries holds pre-built SQL for a specific table name.
 type clientQueries struct {
-	fetch   string
+	fetch    string
 	complete string
 	retry    string
 	fail     string
@@ -110,12 +112,18 @@ RETURNING {t}.id, {t}.kind, {t}.args, {t}.state,
           {t}.scheduled_at, {t}.created_at, {t}.attempted_at,
           {t}.completed_at, {t}.error`),
 
-		complete: r(`UPDATE {t} SET state = '{completed}', completed_at = now() WHERE id = $1`),
-		retry:    r(`UPDATE {t} SET state = '{available}', scheduled_at = now() + $2 * interval '1 second', error = $3 WHERE id = $1`),
-		fail:     r(`UPDATE {t} SET state = '{failed}', completed_at = now(), error = $2 WHERE id = $1`),
-		discard:  r(`UPDATE {t} SET state = '{discarded}', completed_at = now(), error = $2 WHERE id = $1`),
-		rescue:   r(`UPDATE {t} SET state = '{available}', scheduled_at = now() WHERE state = '{running}' AND queue = $2 AND attempted_at < now() - $1 * interval '1 second'`),
-		release:  r(`UPDATE {t} SET state = '{available}', attempt = attempt - 1, attempted_at = NULL WHERE id = ANY($1) AND state = '{running}'`),
+		complete: r(`UPDATE {t} SET state = '{completed}', completed_at = now() WHERE id = $1 AND state = '{running}' AND attempt = $2`),
+		retry: r(
+			`UPDATE {t} SET state = '{available}', scheduled_at = now() + $3 * interval '1 second', error = $4 WHERE id = $1 AND state = '{running}' AND attempt = $2`,
+		),
+		fail:    r(`UPDATE {t} SET state = '{failed}', completed_at = now(), error = $3 WHERE id = $1 AND state = '{running}' AND attempt = $2`),
+		discard: r(`UPDATE {t} SET state = '{discarded}', completed_at = now(), error = $3 WHERE id = $1 AND state = '{running}' AND attempt = $2`),
+		rescue: r(
+			`UPDATE {t} SET state = '{available}', scheduled_at = now() WHERE state = '{running}' AND queue = $2 AND attempted_at < now() - $1 * interval '1 second' AND kind = ANY($3)`,
+		),
+		release: r(
+			`UPDATE {t} SET state = '{available}', attempt = attempt - 1, attempted_at = NULL WHERE id = ANY($1) AND state = '{running}'`,
+		),
 	}
 }
 
@@ -142,22 +150,22 @@ type Client struct {
 func NewClient(cfg ClientConfig) (*Client, error) {
 	cfg.setDefaults()
 	if cfg.Pool == nil {
-		return nil, fmt.Errorf("pgxq: Pool is required")
+		return nil, errors.New("pgxq: Pool is required")
 	}
 	if err := validateTable(cfg.Table); err != nil {
 		return nil, err
 	}
 	if cfg.PollInterval < 0 {
-		return nil, fmt.Errorf("pgxq: PollInterval must not be negative")
+		return nil, errors.New("pgxq: PollInterval must not be negative")
 	}
 	if cfg.BatchSize < 0 {
-		return nil, fmt.Errorf("pgxq: BatchSize must not be negative")
+		return nil, errors.New("pgxq: BatchSize must not be negative")
 	}
 	if cfg.MaxWorkers < 0 {
-		return nil, fmt.Errorf("pgxq: MaxWorkers must not be negative")
+		return nil, errors.New("pgxq: MaxWorkers must not be negative")
 	}
 	if cfg.RescueAfter < 0 {
-		return nil, fmt.Errorf("pgxq: RescueAfter must not be negative")
+		return nil, errors.New("pgxq: RescueAfter must not be negative")
 	}
 	pollCtx, pollCancel := context.WithCancel(context.Background())
 	jobCtx, jobCancel := context.WithCancel(context.Background())
@@ -165,11 +173,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg:        cfg,
 		queries:    buildQueries(cfg.Table),
 		handlers:   make(map[string]HandlerFunc),
-		done:       make(chan struct{}),
 		pollCtx:    pollCtx,
 		pollCancel: pollCancel,
 		jobCtx:     jobCtx,
 		jobCancel:  jobCancel,
+		done:       make(chan struct{}),
 	}, nil
 }
 
@@ -188,7 +196,7 @@ func (c *Client) Handle(kind string, fn HandlerFunc) {
 }
 
 // Start begins polling and processing jobs. It blocks until [Client.Stop]
-// is called and all active jobs complete.
+// is called and all active jobs complete. Returns nil on normal shutdown.
 // Returns an error if called more than once.
 //
 // Handlers must respect ctx.Done() for graceful shutdown. If a handler
@@ -198,7 +206,11 @@ func (c *Client) Start() error {
 	c.mu.Lock()
 	if c.started {
 		c.mu.Unlock()
-		return fmt.Errorf("pgxq: client already started")
+		return errors.New("pgxq: client already started")
+	}
+	if c.pollCtx.Err() != nil {
+		c.mu.Unlock()
+		return errors.New("pgxq: client already stopped")
 	}
 	c.started = true
 	c.mu.Unlock()
@@ -287,7 +299,7 @@ func (c *Client) Stop(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		c.jobCancel()
-		return ctx.Err()
+		return fmt.Errorf("pgxq: stop: %w", ctx.Err())
 	}
 }
 
@@ -302,19 +314,33 @@ func (c *Client) fetchBatch(ctx context.Context) ([]*Job, error) {
 	for rows.Next() {
 		j, scanErr := scanJob(rows)
 		if scanErr != nil {
-			return nil, fmt.Errorf("pgxq: scan: %w", scanErr)
+			// Return already-scanned jobs instead of losing them.
+			// Unscanned rows stay in 'running' until rescue picks them up.
+			c.cfg.Logger.Error("pgxq: scan job, returning partial batch", "scanned", len(jobs), "err", scanErr)
+			return jobs, nil
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, rows.Err()
+	if err := rows.Err(); err != nil {
+		c.cfg.Logger.Error("pgxq: rows iteration error, returning partial batch", "scanned", len(jobs), "err", err)
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].Priority != jobs[j].Priority {
+			return jobs[i].Priority < jobs[j].Priority
+		}
+		return jobs[i].ScheduledAt.Before(jobs[j].ScheduledAt)
+	})
+	return jobs, nil
 }
 
 func (c *Client) processJob(ctx context.Context, job *Job) {
+	// Fetch query filters by registered kinds, so this should never happen.
+	// Defensive: discard the job if it somehow arrives without a handler.
 	handler, ok := c.handlers[job.Kind]
 	if !ok {
 		errMsg := fmt.Sprintf("no handler registered for kind %q", job.Kind)
 		c.cfg.Logger.Error("pgxq: "+errMsg, "job_id", job.ID)
-		if _, err := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, errMsg); err != nil {
+		if _, err := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, job.Attempt, errMsg); err != nil {
 			c.cfg.Logger.Error("pgxq: discard (no handler)", "job_id", job.ID, "err", err)
 		}
 		return
@@ -334,8 +360,18 @@ func (c *Client) processJob(ctx context.Context, job *Job) {
 		if r := recover(); r != nil {
 			_ = tx.Rollback(ctx)
 			errMsg := fmt.Sprintf("panic: %v", r)
-			c.cfg.Logger.Error("pgxq: handler panic", "job_id", job.ID, "kind", job.Kind, "panic", r, "stack", string(debug.Stack()))
-			if _, execErr := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, errMsg); execErr != nil {
+			c.cfg.Logger.Error(
+				"pgxq: handler panic",
+				"job_id",
+				job.ID,
+				"kind",
+				job.Kind,
+				"panic",
+				r,
+				"stack",
+				string(debug.Stack()),
+			)
+			if _, execErr := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, job.Attempt, errMsg); execErr != nil {
 				c.cfg.Logger.Error("pgxq: discard after panic", "job_id", job.ID, "err", execErr)
 			}
 		}
@@ -344,8 +380,14 @@ func (c *Client) processJob(ctx context.Context, job *Job) {
 	handlerErr := handler(ctx, tx, job)
 
 	if handlerErr == nil {
-		if _, err := tx.Exec(ctx, c.queries.complete, job.ID); err != nil {
+		ct, err := tx.Exec(ctx, c.queries.complete, job.ID, job.Attempt)
+		if err != nil {
 			c.cfg.Logger.Error("pgxq: complete", "job_id", job.ID, "err", err)
+			_ = tx.Rollback(ctx)
+			return
+		}
+		if ct.RowsAffected() == 0 {
+			c.cfg.Logger.Warn("pgxq: job already rescued, discarding handler result", "job_id", job.ID)
 			_ = tx.Rollback(ctx)
 			return
 		}
@@ -366,24 +408,55 @@ func (c *Client) handleError(ctx context.Context, job *Job, err error) {
 
 	if isDiscard(err) {
 		c.cfg.Logger.Warn("pgxq: job discarded", "job_id", job.ID, "kind", job.Kind, "err", errMsg)
-		if _, execErr := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, errMsg); execErr != nil {
+		ct, execErr := c.cfg.Pool.Exec(ctx, c.queries.discard, job.ID, job.Attempt, errMsg)
+		if execErr != nil {
 			c.cfg.Logger.Error("pgxq: discard", "job_id", job.ID, "err", execErr)
+		} else if ct.RowsAffected() == 0 {
+			c.cfg.Logger.Warn("pgxq: discard skipped, job already rescued", "job_id", job.ID)
 		}
 		return
 	}
 
 	if job.Attempt >= job.MaxAttempts {
-		c.cfg.Logger.Error("pgxq: job failed (max attempts)", "job_id", job.ID, "kind", job.Kind, "attempts", job.Attempt, "err", errMsg)
-		if _, execErr := c.cfg.Pool.Exec(ctx, c.queries.fail, job.ID, errMsg); execErr != nil {
+		c.cfg.Logger.Error(
+			"pgxq: job failed (max attempts)",
+			"job_id",
+			job.ID,
+			"kind",
+			job.Kind,
+			"attempts",
+			job.Attempt,
+			"err",
+			errMsg,
+		)
+		ct, execErr := c.cfg.Pool.Exec(ctx, c.queries.fail, job.ID, job.Attempt, errMsg)
+		if execErr != nil {
 			c.cfg.Logger.Error("pgxq: fail", "job_id", job.ID, "err", execErr)
+		} else if ct.RowsAffected() == 0 {
+			c.cfg.Logger.Warn("pgxq: fail skipped, job already rescued", "job_id", job.ID)
 		}
 		return
 	}
 
 	delay := c.cfg.Backoff(int(job.Attempt))
-	c.cfg.Logger.Warn("pgxq: job retry", "job_id", job.ID, "kind", job.Kind, "attempt", job.Attempt, "delay", delay, "err", errMsg)
-	if _, execErr := c.cfg.Pool.Exec(ctx, c.queries.retry, job.ID, delay.Seconds(), errMsg); execErr != nil {
+	c.cfg.Logger.Warn(
+		"pgxq: job retry",
+		"job_id",
+		job.ID,
+		"kind",
+		job.Kind,
+		"attempt",
+		job.Attempt,
+		"delay",
+		delay,
+		"err",
+		errMsg,
+	)
+	ct, execErr := c.cfg.Pool.Exec(ctx, c.queries.retry, job.ID, job.Attempt, delay.Seconds(), errMsg)
+	if execErr != nil {
 		c.cfg.Logger.Error("pgxq: retry", "job_id", job.ID, "err", execErr)
+	} else if ct.RowsAffected() == 0 {
+		c.cfg.Logger.Warn("pgxq: retry skipped, job already rescued", "job_id", job.ID)
 	}
 }
 
@@ -410,7 +483,7 @@ func (c *Client) rescueLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		rescued, err := c.cfg.Pool.Exec(ctx, c.queries.rescue, c.cfg.RescueAfter.Seconds(), c.cfg.Queue)
+		rescued, err := c.cfg.Pool.Exec(ctx, c.queries.rescue, c.cfg.RescueAfter.Seconds(), c.cfg.Queue, c.kinds)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

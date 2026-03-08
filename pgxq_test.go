@@ -76,7 +76,7 @@ func TestMain(m *testing.M) {
 
 func truncate(t *testing.T) {
 	t.Helper()
-	_, err := testPool.Exec(context.Background(), "TRUNCATE "+pgxq.DefaultTable)
+	_, err := testPool.Exec(t.Context(), "TRUNCATE "+pgxq.DefaultTable)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -89,7 +89,7 @@ func silentLogger() *slog.Logger {
 func jobState(t *testing.T, id int64) pgxq.JobState {
 	t.Helper()
 	var state pgxq.JobState
-	err := testPool.QueryRow(context.Background(),
+	err := testPool.QueryRow(t.Context(),
 		"SELECT state FROM "+pgxq.DefaultTable+" WHERE id = $1", id).Scan(&state)
 	if err != nil {
 		t.Fatalf("query job state: %v", err)
@@ -116,7 +116,7 @@ func waitForState(t *testing.T, id int64, want pgxq.JobState) {
 func jobCount(t *testing.T) int {
 	t.Helper()
 	var n int
-	err := testPool.QueryRow(context.Background(),
+	err := testPool.QueryRow(t.Context(),
 		"SELECT count(*) FROM "+pgxq.DefaultTable).Scan(&n)
 	if err != nil {
 		t.Fatalf("count: %v", err)
@@ -144,7 +144,7 @@ func newClient(t *testing.T, opts ...func(*pgxq.ClientConfig)) *pgxq.Client {
 // stopClient is a test helper: stops client with a generous timeout.
 func stopClient(t *testing.T, client *pgxq.Client) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if err := client.Stop(ctx); err != nil {
 		t.Errorf("stop: %v", err)
@@ -162,7 +162,7 @@ type testArgs struct {
 func TestInsert(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "hello"})
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "hello"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestInsertOptions(t *testing.T) {
 	truncate(t)
 	scheduled := time.Now().Add(time.Hour).Truncate(time.Microsecond)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "opts"},
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "opts"},
 		pgxq.WithQueue("emails"),
 		pgxq.WithPriority(-5),
 		pgxq.WithScheduledAt(scheduled),
@@ -222,7 +222,7 @@ func TestInsertOptions(t *testing.T) {
 
 func TestInsertTransactional(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Commit: job should exist.
 	tx, err := testPool.Begin(ctx)
@@ -233,8 +233,8 @@ func TestInsertTransactional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatalf("commit: %v", commitErr)
 	}
 	if n := jobCount(t); n != 1 {
 		t.Fatalf("after commit: got %d jobs, want 1", n)
@@ -249,8 +249,8 @@ func TestInsertTransactional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := tx2.Rollback(ctx); err != nil {
-		t.Fatalf("rollback: %v", err)
+	if rollbackErr := tx2.Rollback(ctx); rollbackErr != nil {
+		t.Fatalf("rollback: %v", rollbackErr)
 	}
 	if n := jobCount(t); n != 1 {
 		t.Fatalf("after rollback: got %d jobs, want 1", n)
@@ -260,7 +260,20 @@ func TestInsertTransactional(t *testing.T) {
 func TestInsertNilArgs(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", nil)
+	job, err := pgxq.Insert(t.Context(), testPool, "test", nil)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if string(job.Args) != "{}" {
+		t.Errorf("args: got %s, want {}", job.Args)
+	}
+}
+
+func TestInsertTypedNilArgs(t *testing.T) {
+	truncate(t)
+
+	var args *testArgs // typed nil
+	job, err := pgxq.Insert(t.Context(), testPool, "test", args)
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -272,7 +285,7 @@ func TestInsertNilArgs(t *testing.T) {
 func TestInsertEmptyKind(t *testing.T) {
 	truncate(t)
 
-	_, err := pgxq.Insert(context.Background(), testPool, "", nil)
+	_, err := pgxq.Insert(t.Context(), testPool, "", nil)
 	if err == nil {
 		t.Error("expected error for empty kind")
 	}
@@ -281,12 +294,12 @@ func TestInsertEmptyKind(t *testing.T) {
 func TestInsertInvalidMaxAttempts(t *testing.T) {
 	truncate(t)
 
-	_, err := pgxq.Insert(context.Background(), testPool, "test", nil, pgxq.WithMaxAttempts(0))
+	_, err := pgxq.Insert(t.Context(), testPool, "test", nil, pgxq.WithMaxAttempts(0))
 	if err == nil {
 		t.Error("expected error for max_attempts=0")
 	}
 
-	_, err = pgxq.Insert(context.Background(), testPool, "test", nil, pgxq.WithMaxAttempts(-1))
+	_, err = pgxq.Insert(t.Context(), testPool, "test", nil, pgxq.WithMaxAttempts(-1))
 	if err == nil {
 		t.Error("expected error for max_attempts=-1")
 	}
@@ -297,7 +310,7 @@ func TestInsertInvalidMaxAttempts(t *testing.T) {
 func TestClientProcess(t *testing.T) {
 	truncate(t)
 
-	_, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "process_me"})
+	_, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "process_me"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -305,16 +318,15 @@ func TestClientProcess(t *testing.T) {
 	received := make(chan testArgs, 1)
 	client := newClient(t)
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, job *pgxq.Job) error {
-		a, err := pgxq.UnmarshalArgs[testArgs](job)
-		if err != nil {
-			return err
+		a, unmarshalErr := pgxq.UnmarshalArgs[testArgs](job)
+		if unmarshalErr != nil {
+			return unmarshalErr
 		}
 		received <- a
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case a := <-received:
 		if a.Value != "process_me" {
@@ -327,7 +339,7 @@ func TestClientProcess(t *testing.T) {
 	stopClient(t, client)
 
 	var state pgxq.JobState
-	err = testPool.QueryRow(context.Background(),
+	err = testPool.QueryRow(t.Context(),
 		"SELECT state FROM "+pgxq.DefaultTable+" LIMIT 1").Scan(&state)
 	if err != nil {
 		t.Fatalf("query: %v", err)
@@ -339,14 +351,14 @@ func TestClientProcess(t *testing.T) {
 
 func TestClientHandlerTx(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := testPool.Exec(ctx, "CREATE TABLE IF NOT EXISTS pgxq_test_scratch (value TEXT)")
 	if err != nil {
 		t.Fatalf("create scratch: %v", err)
 	}
 	t.Cleanup(func() {
-		testPool.Exec(context.Background(), "DROP TABLE IF EXISTS pgxq_test_scratch") //nolint:errcheck
+		_, _ = testPool.Exec(t.Context(), "DROP TABLE IF EXISTS pgxq_test_scratch")
 	})
 
 	_, err = pgxq.Insert(ctx, testPool, "test", testArgs{Value: "atomic"})
@@ -356,17 +368,16 @@ func TestClientHandlerTx(t *testing.T) {
 
 	done := make(chan struct{})
 	client := newClient(t)
-	client.Handle("test", func(ctx context.Context, tx pgx.Tx, _ *pgxq.Job) error {
-		_, err := tx.Exec(ctx, "INSERT INTO pgxq_test_scratch (value) VALUES ($1)", "from_handler")
-		if err != nil {
-			return err
+	client.Handle("test", func(handlerCtx context.Context, tx pgx.Tx, _ *pgxq.Job) error {
+		_, execErr := tx.Exec(handlerCtx, "INSERT INTO pgxq_test_scratch (value) VALUES ($1)", "from_handler")
+		if execErr != nil {
+			return execErr
 		}
 		close(done)
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -376,7 +387,7 @@ func TestClientHandlerTx(t *testing.T) {
 	stopClient(t, client)
 
 	var value string
-	err = testPool.QueryRow(context.Background(),
+	err = testPool.QueryRow(t.Context(),
 		"SELECT value FROM pgxq_test_scratch LIMIT 1").Scan(&value)
 	if err != nil {
 		t.Fatalf("query scratch: %v", err)
@@ -389,7 +400,13 @@ func TestClientHandlerTx(t *testing.T) {
 func TestClientRetry(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "retry_me"}, pgxq.WithMaxAttempts(3))
+	job, err := pgxq.Insert(
+		t.Context(),
+		testPool,
+		"test",
+		testArgs{Value: "retry_me"},
+		pgxq.WithMaxAttempts(3),
+	)
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -409,8 +426,7 @@ func TestClientRetry(t *testing.T) {
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -430,7 +446,7 @@ func TestClientRetry(t *testing.T) {
 func TestClientDiscard(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "discard_me"})
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "discard_me"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -439,11 +455,10 @@ func TestClientDiscard(t *testing.T) {
 	client := newClient(t)
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error {
 		close(done)
-		return pgxq.Discard(fmt.Errorf("bad payload"))
+		return pgxq.Discard(errors.New("bad payload"))
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -460,7 +475,7 @@ func TestClientDiscard(t *testing.T) {
 func TestClientMaxAttempts(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "fail_me"}, pgxq.WithMaxAttempts(2))
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "fail_me"}, pgxq.WithMaxAttempts(2))
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -472,11 +487,10 @@ func TestClientMaxAttempts(t *testing.T) {
 	})
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error {
 		attempts.Add(1)
-		return fmt.Errorf("always fail")
+		return errors.New("always fail")
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	waitForState(t, job.ID, pgxq.JobStateFailed)
 	stopClient(t, client)
 
@@ -488,7 +502,7 @@ func TestClientMaxAttempts(t *testing.T) {
 func TestClientUnknownKind(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "unknown"})
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "unknown"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -496,8 +510,7 @@ func TestClientUnknownKind(t *testing.T) {
 	// Client only handles "other_kind" — should not fetch "test" jobs.
 	client := newClient(t)
 	client.Handle("other_kind", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error { return nil })
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	// Wait a bit and verify the job is still available (not fetched).
 	time.Sleep(300 * time.Millisecond)
 	if s := jobState(t, job.ID); s != pgxq.JobStateAvailable {
@@ -509,7 +522,7 @@ func TestClientUnknownKind(t *testing.T) {
 func TestClientHandlerPanic(t *testing.T) {
 	truncate(t)
 
-	job, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "panic"})
+	job, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "panic"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -519,14 +532,13 @@ func TestClientHandlerPanic(t *testing.T) {
 		panic("handler exploded")
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	waitForState(t, job.ID, pgxq.JobStateDiscarded)
 	stopClient(t, client)
 
 	// Verify error message contains panic info.
 	var errMsg *string
-	err = testPool.QueryRow(context.Background(),
+	err = testPool.QueryRow(t.Context(),
 		"SELECT error FROM "+pgxq.DefaultTable+" WHERE id = $1", job.ID).Scan(&errMsg)
 	if err != nil {
 		t.Fatalf("query: %v", err)
@@ -538,10 +550,10 @@ func TestClientHandlerPanic(t *testing.T) {
 
 func TestConcurrentWorkers(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	const numJobs = 20
-	for i := 0; i < numJobs; i++ {
+	for i := range numJobs {
 		_, err := pgxq.Insert(ctx, testPool, "test", testArgs{Value: fmt.Sprintf("job_%d", i)})
 		if err != nil {
 			t.Fatalf("insert %d: %v", i, err)
@@ -563,8 +575,7 @@ func TestConcurrentWorkers(t *testing.T) {
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -587,7 +598,7 @@ func TestConcurrentWorkers(t *testing.T) {
 func TestGracefulShutdown(t *testing.T) {
 	truncate(t)
 
-	_, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "slow"})
+	_, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "slow"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -613,7 +624,7 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 
 	// Stop with enough time for the handler to finish.
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stopCancel()
 	if err := client.Stop(stopCtx); err != nil {
 		t.Errorf("Stop returned error: %v", err)
@@ -626,9 +637,9 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 
 	select {
-	case err := <-clientDone:
-		if err != nil {
-			t.Errorf("Start returned error: %v", err)
+	case startErr := <-clientDone:
+		if startErr != nil {
+			t.Errorf("Start returned error: %v", startErr)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not return")
@@ -639,15 +650,14 @@ func TestGracefulShutdown(t *testing.T) {
 
 func TestCustomTable(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	table := "pgxq_custom_test"
 
 	if err := pgxq.Migrate(ctx, testPool, table); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(func() {
-		testPool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table) //nolint:errcheck
-	})
+		testPool.Exec(t.Context(), "DROP TABLE IF EXISTS "+table)	})
 
 	job, err := pgxq.Insert(ctx, testPool, "test", testArgs{Value: "custom"}, pgxq.WithTable(table))
 	if err != nil {
@@ -669,28 +679,28 @@ func TestCustomTable(t *testing.T) {
 }
 
 func TestValidateTable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := testPool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS myschema")
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 	t.Cleanup(func() {
-		testPool.Exec(context.Background(), "DROP SCHEMA myschema CASCADE") //nolint:errcheck
-	})
+		testPool.Exec(t.Context(), "DROP SCHEMA myschema CASCADE")	})
 
-	for _, name := range []string{"pgxq_valid", "myschema.jobs", "Jobs123"} {
-		if err := pgxq.Migrate(ctx, testPool, name); err != nil {
-			t.Errorf("valid name %q: %v", name, err)
+	for _, name := range []string{"pgxq_valid", "myschema.jobs"} {
+		if migrateErr := pgxq.Migrate(ctx, testPool, name); migrateErr != nil {
+			t.Errorf("valid name %q: %v", name, migrateErr)
 		}
-		testPool.Exec(ctx, "DROP TABLE IF EXISTS "+name) //nolint:errcheck
-	}
+		testPool.Exec(ctx, "DROP TABLE IF EXISTS "+name)	}
 
-	for _, name := range []string{"", "drop table;", "my-jobs", "foo bar", "a.b.c", ".foo", "foo.", "123table", "schema.123t"} {
-		if err := pgxq.Migrate(ctx, testPool, name); err == nil {
+	for _, name := range []string{
+		"", "drop table;", "my-jobs", "foo bar", "a.b.c",
+		".foo", "foo.", "123table", "schema.123t", "Jobs123",
+	} {
+		if migrateErr := pgxq.Migrate(ctx, testPool, name); migrateErr == nil {
 			t.Errorf("invalid name %q: expected error", name)
-			testPool.Exec(ctx, "DROP TABLE IF EXISTS "+name) //nolint:errcheck
-		}
+			testPool.Exec(ctx, "DROP TABLE IF EXISTS "+name)		}
 	}
 }
 
@@ -698,16 +708,19 @@ func TestValidateTable(t *testing.T) {
 
 func TestRescueOrphanedJobs(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert a job, then manually set it to "running" with old attempted_at.
 	job, err := pgxq.Insert(ctx, testPool, "test", testArgs{Value: "orphaned"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	_, err = testPool.Exec(ctx,
-		"UPDATE "+pgxq.DefaultTable+" SET state = 'running', attempted_at = now() - interval '2 hours', attempt = 1 WHERE id = $1",
-		job.ID)
+	_, err = testPool.Exec(
+		ctx,
+		"UPDATE "+pgxq.DefaultTable+
+			" SET state = 'running', attempted_at = now() - interval '2 hours', attempt = 1 WHERE id = $1",
+		job.ID,
+	)
 	if err != nil {
 		t.Fatalf("update to running: %v", err)
 	}
@@ -723,8 +736,7 @@ func TestRescueOrphanedJobs(t *testing.T) {
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-processed:
 		// Job was rescued (returned to available) and then picked up.
@@ -761,7 +773,7 @@ func TestSchema(t *testing.T) {
 // --- error tests ---
 
 func TestDiscardError(t *testing.T) {
-	orig := fmt.Errorf("bad payload")
+	orig := errors.New("bad payload")
 	wrapped := pgxq.Discard(orig)
 
 	// Error message includes "discard:".
@@ -774,7 +786,7 @@ func TestDiscardError(t *testing.T) {
 	if !errors.As(wrapped, &de) {
 		t.Fatal("errors.As failed for DiscardError")
 	}
-	if de.Unwrap() != orig {
+	if !errors.Is(de.Unwrap(), orig) {
 		t.Errorf("Unwrap: got %v, want %v", de.Unwrap(), orig)
 	}
 
@@ -788,19 +800,31 @@ func TestDiscardError(t *testing.T) {
 func TestStartAlreadyStarted(t *testing.T) {
 	truncate(t)
 
-	client := newClient(t)
-	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error { return nil })
+	// Insert a job so the handler can signal that Start is running.
+	_, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "sync"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
 
 	started := make(chan struct{})
-	go func() {
-		close(started)
-		client.Start() //nolint:errcheck
-	}()
-	<-started
-	// Give Start a moment to set the flag.
-	time.Sleep(50 * time.Millisecond)
+	client := newClient(t)
+	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		return nil
+	})
 
-	err := client.Start()
+	go client.Start()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for handler")
+	}
+
+	err = client.Start()
 	if err == nil || !strings.Contains(err.Error(), "already started") {
 		t.Errorf("second Start: got %v, want 'already started' error", err)
 	}
@@ -810,11 +834,29 @@ func TestStartAlreadyStarted(t *testing.T) {
 func TestHandleAfterStartPanics(t *testing.T) {
 	truncate(t)
 
-	client := newClient(t)
-	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error { return nil })
+	// Insert a job so the handler can signal that Start is running.
+	_, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "sync"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
 
-	go client.Start() //nolint:errcheck
-	time.Sleep(50 * time.Millisecond)
+	started := make(chan struct{})
+	client := newClient(t)
+	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		return nil
+	})
+
+	go client.Start()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for handler")
+	}
 
 	defer stopClient(t, client)
 	defer func() {
@@ -868,10 +910,26 @@ func TestStopBeforeStart(t *testing.T) {
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error { return nil })
 
 	// Stop before Start should not panic.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	if err := client.Stop(ctx); err != nil {
 		t.Errorf("Stop before Start: %v", err)
+	}
+}
+
+func TestStartAfterStopBeforeStart(t *testing.T) {
+	client := newClient(t)
+	client.Handle("test", func(_ context.Context, _ pgx.Tx, _ *pgxq.Job) error { return nil })
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := client.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	err := client.Start()
+	if err == nil || !strings.Contains(err.Error(), "already stopped") {
+		t.Errorf("Start after Stop: got %v, want 'already stopped' error", err)
 	}
 }
 
@@ -879,7 +937,7 @@ func TestStopBeforeStart(t *testing.T) {
 
 func TestPriorityOrdering(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert jobs with different priorities (lower = runs first).
 	for _, p := range []int16{10, -5, 0, 5} {
@@ -898,9 +956,9 @@ func TestPriorityOrdering(t *testing.T) {
 		c.BatchSize = 4
 	})
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, job *pgxq.Job) error {
-		a, err := pgxq.UnmarshalArgs[testArgs](job)
-		if err != nil {
-			return err
+		a, unmarshalErr := pgxq.UnmarshalArgs[testArgs](job)
+		if unmarshalErr != nil {
+			return unmarshalErr
 		}
 		order = append(order, a.Value)
 		if len(order) == 4 {
@@ -909,8 +967,7 @@ func TestPriorityOrdering(t *testing.T) {
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -931,7 +988,7 @@ func TestPriorityOrdering(t *testing.T) {
 
 func TestScheduledAtFuture(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert a job scheduled 1 hour from now — should NOT be picked up.
 	_, err := pgxq.Insert(ctx, testPool, "test", testArgs{Value: "future"},
@@ -949,16 +1006,15 @@ func TestScheduledAtFuture(t *testing.T) {
 	received := make(chan string, 2)
 	client := newClient(t)
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, job *pgxq.Job) error {
-		a, err := pgxq.UnmarshalArgs[testArgs](job)
-		if err != nil {
-			return err
+		a, unmarshalErr := pgxq.UnmarshalArgs[testArgs](job)
+		if unmarshalErr != nil {
+			return unmarshalErr
 		}
 		received <- a.Value
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case v := <-received:
 		if v != "now" {
@@ -981,7 +1037,7 @@ func TestScheduledAtFuture(t *testing.T) {
 
 func TestQueueIsolation(t *testing.T) {
 	truncate(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert jobs into different queues.
 	_, err := pgxq.Insert(ctx, testPool, "test", testArgs{Value: "email"}, pgxq.WithQueue("emails"))
@@ -1000,16 +1056,15 @@ func TestQueueIsolation(t *testing.T) {
 		c.Queue = "emails"
 	})
 	client.Handle("test", func(_ context.Context, _ pgx.Tx, job *pgxq.Job) error {
-		a, err := pgxq.UnmarshalArgs[testArgs](job)
-		if err != nil {
-			return err
+		a, unmarshalErr := pgxq.UnmarshalArgs[testArgs](job)
+		if unmarshalErr != nil {
+			return unmarshalErr
 		}
 		received <- a.Value
 		return nil
 	})
 
-	go client.Start() //nolint:errcheck
-
+	go client.Start()
 	select {
 	case v := <-received:
 		if v != "email" {
@@ -1030,7 +1085,7 @@ func TestQueueIsolation(t *testing.T) {
 
 	// Verify default job is still available.
 	var state pgxq.JobState
-	err = testPool.QueryRow(context.Background(),
+	err = testPool.QueryRow(t.Context(),
 		"SELECT state FROM "+pgxq.DefaultTable+" WHERE id = $1", defaultJob.ID).Scan(&state)
 	if err != nil {
 		t.Fatalf("query: %v", err)
@@ -1043,13 +1098,13 @@ func TestQueueIsolation(t *testing.T) {
 func TestShutdownTimeout(t *testing.T) {
 	truncate(t)
 
-	_, err := pgxq.Insert(context.Background(), testPool, "test", testArgs{Value: "blocking"})
+	_, err := pgxq.Insert(t.Context(), testPool, "test", testArgs{Value: "blocking"})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
 	handlerStarted := make(chan struct{})
-	handlerCtx, handlerCancel := context.WithCancel(context.Background())
+	handlerCtx, handlerCancel := context.WithCancel(t.Context())
 	defer handlerCancel()
 
 	client := newClient(t)
@@ -1073,7 +1128,7 @@ func TestShutdownTimeout(t *testing.T) {
 	}
 
 	// Stop with a short timeout — should return ctx.Err().
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	stopCtx, stopCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer stopCancel()
 	err = client.Stop(stopCtx)
 	if err == nil {

@@ -3,6 +3,7 @@ package pgxq
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -19,7 +20,7 @@ func createTableQuery(table string) string {
 		"{t}", table,
 		"{available}", string(JobStateAvailable),
 		"{all_states}", allStates,
-		"{max_attempts}", fmt.Sprintf("%d", defaultMaxAttempts),
+		"{max_attempts}", strconv.Itoa(defaultMaxAttempts),
 	).Replace(`CREATE TABLE IF NOT EXISTS {t} (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     kind          TEXT        NOT NULL,
@@ -44,7 +45,7 @@ func createIndexQuery(table, suffix, columns, where string) string {
 }
 
 func createFetchIndexQuery(table string) string {
-	return createIndexQuery(table, "fetch", "queue, priority, scheduled_at", "state = '"+string(JobStateAvailable)+"'")
+	return createIndexQuery(table, "fetch", "queue, kind, priority, scheduled_at", "state = '"+string(JobStateAvailable)+"'")
 }
 
 func createRescueIndexQuery(table string) string {
@@ -56,7 +57,10 @@ func Schema(table string) (string, error) {
 	if err := validateTable(table); err != nil {
 		return "", err
 	}
-	return createTableQuery(table) + ";\n" + createFetchIndexQuery(table) + ";\n" + createRescueIndexQuery(table) + ";\n", nil
+	sql := createTableQuery(table) + ";\n" +
+		createFetchIndexQuery(table) + ";\n" +
+		createRescueIndexQuery(table) + ";\n"
+	return sql, nil
 }
 
 // Migrate creates the job table and indexes if they don't exist.
